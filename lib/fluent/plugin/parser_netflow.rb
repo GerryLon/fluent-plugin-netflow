@@ -5,6 +5,7 @@ require 'fluent/plugin/parser'
 
 require_relative 'netflow_records'
 require_relative 'vash'
+require_relative 'util'
 
 module Fluent
   module Plugin
@@ -14,8 +15,18 @@ module Fluent
 
       config_param :switched_times_from_uptime, :bool, default: false
       config_param :cache_ttl, :integer, default: 4000
-      config_param :versions, :array, default: [5, 9]
+      config_param :versions, :array, default: [5, 9, 10]
       config_param :definitions, :string, default: nil
+
+      config_param :cache_save_path, :string, default: "/tmp"
+
+      # add by gerrylon start
+      # Override YAML file containing IPFIX field definitions
+      config :ipfix_definitions, :string, default: nil
+      # add by gerrylon end
+
+      TIMESTAMP_KEY = '@timestamp'
+      IPFIX_FIELDS = ['version']
 
       # Cisco NetFlow Export Datagram Format
       # http://www.cisco.com/c/en/us/td/docs/net_mgmt/netflow_collection_engine/3-6/user/guide/format.html
@@ -27,28 +38,38 @@ module Fluent
 
         @templates = Vash.new()
         @samplers_v9 = Vash.new()
+        @ipfix_templates = TemplateRegistry.new($log, @cache_ttl, @cache_save_path && "#{@cache_save_path}/ipfix_templates.cache")
+
+
         # Path to default Netflow v9 field definitions
         filename = File.expand_path('../netflow_fields.yaml', __FILE__)
+        ipfix_filename = File.expand_path('../ipfix_fields.yaml', __FILE__)
 
+        @template_fields = load_definations(filename, @definitions)
+        @ipfix_fields = load_definations(ipfix_filename, @ipfix_definitions)  
+      end
+
+      def load_definations(defaults, extra)
         begin
-          @template_fields = YAML.load_file(filename)
+          fields = YAML.load_file(defaults)
         rescue => e
-          raise Fluent::ConfigError, "Bad syntax in definitions file #{filename}, error_class = #{e.class.name}, error = #{e.message}"
+          raise Fluent::ConfigError, "Bad syntax in definitions file #{defaults}, error_class = #{e.class.name}, error = #{e.message}"
         end
 
-        # Allow the user to augment/override/rename the supported Netflow fields
-        if @definitions
-          raise Fluent::ConfigError, "definitions file #{@definitions} doesn't exist" unless File.exist?(@definitions)
+        if extra
+          raise Fluent::ConfigError, "definitions file #{extra} doesn't exist" unless File.exist?(extra)
           begin
-            @template_fields['option'].merge!(YAML.load_file(@definitions))
+            fields['option'].merge!(YAML.load_file(extra))
           rescue => e
-            raise Fluent::ConfigError, "Bad syntax in definitions file #{@definitions}, error_class = #{e.class.name}, error = #{e.message}"
+            raise Fluent::ConfigError, "Bad syntax in definitions file #{extra}, error_class = #{e.class.name}, error = #{e.message}"
           end
         end
+
+        return fields
       end
 
       def call(payload, host=nil, &block)
-        version,_ = payload[0,2].unpack('n')
+        version, _ = payload[0,2].unpack('n')
         case version
         when 5
           forV5(payload, block)
@@ -56,12 +77,174 @@ module Fluent
           # TODO: implement forV9
           pdu = Netflow9PDU.read(payload)
           handle_v9(host, pdu, block)
+        when 10
+          flowset = IpfixPDU.read(payload)
+          handle_ipfix(host, flowset, block)
         else
           $log.warn "Unsupported Netflow version v#{version}: #{version.class}"
         end
       end
 
       private
+
+      # add by gerrylon start
+      def handle_ipfix(host, flowset, block)
+        flowset.records.each do |record|
+          decode_ipfix(flowset, record).each { |time, event| block.call(time, event) }
+      end
+
+      def decode_ipfix(flowset, record)
+        events = []
+        time = Fluent::EventTime.new(pdu.unix_sec.to_i)
+
+        case record.flowset_id
+        when 2..3
+          record.flowset_data.templates.each do |template|
+            catch (:field) do
+              fields = []
+              # Template flowset (2) or Options template flowset (3) ?
+              template_fields = (record.flowset_id == 2) ? template.record_fields : (template.scope_fields.to_ary + template.option_fields.to_ary)
+              template_fields.each do |field|
+                field_type = field.field_type
+                field_length = field.field_length
+                enterprise_id = field.enterprise ? field.enterprise_id : 0
+
+                entry = ipfix_field_for(field_type, enterprise_id, field.field_length)
+                throw :field unless entry
+                fields += entry
+              end
+              # FIXME Source IP address required in key
+              key = "#{flowset.observation_domain_id}|#{template.template_id}"
+
+              @ipfix_templates.register(key, fields)
+            end
+          end
+        when 256..65535
+          # Data flowset
+          key = "#{flowset.observation_domain_id}|#{record.flowset_id}"
+          template = @ipfix_templates.fetch(key)
+
+          if !template
+            $log.warn("Can't (yet) decode flowset id #{record.flowset_id} from observation domain id #{flowset.observation_domain_id}, because no template to decode it with has been received. This message will usually go away after 1 minute.")
+            return time, events
+          end
+
+          array = BinData::Array.new(:type => template, :read_until => :eof)
+          records = array.read(record.flowset_data)
+
+          records.each do |r|
+            event = {
+              TIMESTAMP_KEY => Time.at(flowset.unix_sec),
+              @target => {}
+            }
+
+            IPFIX_FIELDS.each do |f|
+              event[@target][f] = flowset[f].snapshot
+            end
+
+            if @include_flowset_id
+              event[@target][FLOWSET_ID] = record.flowset_id.snapshot
+            end
+
+            r.each_pair do |k, v|
+              case k.to_s
+              when /^flow(?:Start|End)Seconds$/
+                event[@target][k.to_s] = Time.at(v.snapshot).to_iso8601
+              when /^flow(?:Start|End)(Milli|Micro|Nano)seconds$/
+                case $1
+                when 'Milli'
+                  event[@target][k.to_s] = Time.at(v.snapshot.to_f / 1_000).to_iso8601
+                when 'Micro', 'Nano'
+                  # For now we'll stick to assuming ntp timestamps,
+                  # Netscaler implementation may be buggy though:
+                  # https://bugs.wireshark.org/bugzilla/show_bug.cgi?id=11047
+                  # This only affects the fraction though
+                  ntp_seconds = (v.snapshot >> 32) & 0xFFFFFFFF
+                  ntp_fraction = (v.snapshot & 0xFFFFFFFF).to_f / 2**32
+                  event[@target][k.to_s] = Time.at(Time.utc(1900,1,1).to_i + ntp_seconds, ntp_fraction * 1000000).to_iso8601
+                end
+              else
+                event[@target][k.to_s] = v.snapshot
+              end
+            end
+
+            events << event
+          end
+        else
+          $log.warn("Unsupported flowset id #{record.flowset_id}")
+        end
+
+        return time, events
+      rescue BinData::ValidityError => e
+          $log.warn("Invalid IPFIX packet received (#{e})")
+      end
+
+      def ipfix_field_for(type, enterprise, length)
+        if @ipfix_fields.include?(enterprise)
+          if @ipfix_fields[enterprise].include?(type)
+            field = @ipfix_fields[enterprise][type].clone
+          else
+            $log.warn("Unsupported enterprise field", :type => type, :enterprise => enterprise, :length => length)
+          end
+        else
+          $log.warn("Unsupported enterprise", :enterprise => enterprise)
+        end
+
+        return nil unless field
+
+        if field.is_a?(Array)
+          case field[0]
+          when :skip
+            field = skip_field(field, type, length.to_i)
+          when :string
+            field = string_field(field, type, length.to_i)
+          when :octetarray
+            field[0] = :OctetArray
+            field += [{:initial_length => length.to_i}]
+          when :uint64
+            field[0] = uint_field(length, 8)
+          when :uint32
+            field[0] = uint_field(length, 4)
+          when :uint16
+            field[0] = uint_field(length, 2)
+          when :application_id
+            field[0] = get_rfc6759_application_id_class(field,length)
+          end
+
+          $log.debug("Definition complete", :field => field)
+          [field]
+        else
+          $log.warn("Definition should be an array", :field => field)
+        end
+      end
+
+      # util functions
+      def uint_field(length, default)
+        # If length is 4, return :uint32, etc. and use default if length is 0
+        ("uint" + (((length > 0) ? length : default) * 8).to_s).to_sym
+      end # def uint_field
+
+      def skip_field(field, type, length)
+        if length == 65535
+          field[0] = :VarSkip
+        else
+          field += [nil, {:length => length.to_i}]
+        end
+
+        field
+      end # def skip_field
+
+      def string_field(field, type, length)
+        if length == 65535
+          field[0] = :VarString
+        else
+          field[0] = :string
+          field += [{ :length => length.to_i, :trim_padding => true }]
+        end
+
+        field
+      end # def string_field
+      # add by gerrylon end
 
       def ipv4_addr_to_string(uint32)
         "#{(uint32 & 0xff000000) >> 24}.#{(uint32 & 0x00ff0000) >> 16}.#{(uint32 & 0x0000ff00) >> 8}.#{uint32 & 0x000000ff}"

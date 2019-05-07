@@ -3,7 +3,7 @@ $:.push File.expand_path('../lib', __FILE__)
 
 Gem::Specification.new do |gem|
   gem.name        = "fluent-plugin-netflow"
-  gem.description = "Netflow plugin for Fluentd"
+  gem.description = "Netflow, Ipfix plugin for Fluentd"
   gem.homepage    = "https://github.com/repeatedly/fluent-plugin-netflow"
   gem.summary     = gem.description
   gem.version     = File.read("VERSION").strip

@@ -21,6 +21,8 @@ require 'fluent/plugin/parser_netflow'
 
 module Fluent::Plugin
   class NetflowInput < Input
+
+    # for @type xxx
     Fluent::Plugin.register_input('netflow', self)
 
     helpers :server
@@ -38,6 +40,7 @@ module Fluent::Plugin
     end
     config_param :max_bytes, :integer, default: 2048
 
+    # TODO
     def multi_workers_ready?
       true
     end
@@ -51,6 +54,8 @@ module Fluent::Plugin
 
     def start
       super
+
+      # https://docs.fluentd.org/v1.0/articles/api-plugin-helper-server#server_create(title,-port,-proto:-nil,-bind:-%E2%80%980.0.0.0%E2%80%99,-shared:-true,-socket:-nil,-backlog:-nil,-tls_options:-nil,-max_bytes:-nil,-flags:-0,-**socket_options,-&callback)
       server_create(:in_netflow_server, @port, bind: @bind, proto: @protocol_type, max_bytes: @max_bytes) do |data, sock|
         receive_data(sock.remote_host, data)
       end
