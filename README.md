@@ -185,3 +185,7 @@ See this definitions for PaloAlto Netflow: https://github.com/repeatedly/fluent-
 
 * Netflow v9 protocol parser optimization
 * Use Fluentd feature instead of own handlers
+* when decode ipfix:
+  * [warn]: #0 Unsupported enterprise enterprise=0
+  * #0 Can't (yet) decode flowset id 301 from observation domain id 0, because no template to decode it with has been received. This message will usually go away after 1 minute.
+
