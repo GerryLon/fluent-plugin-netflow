@@ -88,20 +88,20 @@ module Fluent
         # @api private
         def do_load
           unless File.exists?(file_path)
-            logger.warn('Template Cache does not exist', :file_path => file_path)
+            @logger.warn('Template Cache does not exist', :file_path => file_path)
             return
           end
 
-          logger.debug? and logger.debug('Loading templates from template cache', :file_path => file_path)
+          @logger.debug? and logger.debug('Loading templates from template cache', :file_path => file_path)
           file_data = File.read(file_path)
           templates_cache = JSON.parse(file_data)
           templates_cache.each do |key, fields|
             do_register(key, fields)
           end
 
-          logger.warn('Template Cache not writable', file_path: file_path) unless File.writable?(file_path)
+          @logger.warn('Template Cache not writable', file_path: file_path) unless File.writable?(file_path)
         rescue => e
-          logger.error('Template Cache could not be loaded', :file_path => file_path, :exception => e.message)
+          @logger.error('Template Cache could not be loaded', :file_path => file_path, :exception => e.message)
         end
 
         ##
@@ -110,7 +110,11 @@ module Fluent
         def do_persist
           return if file_path.nil?
 
-          logger.debug? and logger.debug('Writing templates to template cache', :file_path => file_path)
+          # puts '--------------------------'
+          # puts @logger.methods
+          # puts '--------------------------'
+
+          @logger.info('Writing templates to template cache', :file_path => file_path)
 
           fail('Template Cache not writable') if File.exists?(file_path) && !File.writable?(file_path)
 
@@ -118,11 +122,16 @@ module Fluent
 
           templates_cache = @bindata_spec_cache
 
+          # File.open(file_path, 'w') do |file|
+          if !File.exists?(file_path)
+            @logger.info("file: #{file_path} not exists, create it:")
+            File.new(file_path, "w")
+          end
           File.open(file_path, 'w') do |file|
             file.write(templates_cache.to_json)
           end
         rescue Exception => e
-          logger.error('Template Cache could not be saved', :file_path => file_path, :exception => e.message)
+          @logger.error('Template Cache could not be saved', :file_path => file_path, :exception => e.message)
         end
 
         ##

@@ -79,7 +79,7 @@ module Fluent
             version, _ = payload[0,2].unpack('n')
             case version
             when 5
-               forV5(payload, block)
+               handle_v5(payload, block)
             when 9
                # TODO: implement forV9
                pdu = Netflow9PDU.read(payload)
@@ -144,7 +144,7 @@ module Fluent
 
                records.each do |r|
                   event = {
-                     TIMESTAMP_KEY => Time.at(flowset.unix_sec),
+                     TIMESTAMP_KEY => format_for_flowMilliSeconds(Time.at(flowset.unix_sec)),
                      # @target => {}
                   }
 
@@ -327,7 +327,7 @@ module Fluent
          #   uint8    :dst_mask #   -> 0x00ff
          #   skip     length: 2 # xx
          # end
-         def forV5(payload, block)
+         def handle_v5(payload, block)
             version, flow_records, uptime, unix_sec, unix_nsec, flow_seq_num, engine, sampling = payload.unpack(NETFLOW_V5_HEADER_FORMAT)
             engine_type = (engine & 0xff00) >> 8
             engine_id = engine & 0x00ff
@@ -458,10 +458,13 @@ module Fluent
 
             # Template shouldn't be longer than the flowset and there should
             # be at most 3 padding bytes
-            if template.num_bytes > length or ! (length % template.num_bytes).between?(0, 3)
-               $log.warn "Template length doesn't fit cleanly into flowset",
-               template_id: flowset.flowset_id, template_length: template.num_bytes, flowset_length: length
-               return
+            if template.num_bytes != nil
+               # if template.num_bytes > length or ! (length % template.num_bytes).between?(0, 3)
+               if template.num_bytes > length
+                  $log.warn "Template length doesn't fit cleanly into flowset",
+                  template_id: flowset.flowset_id, template_length: template.num_bytes, flowset_length: length
+                  return
+               end
             end
 
             array = BinData::Array.new(type: template, initial_length: length / template.num_bytes)
